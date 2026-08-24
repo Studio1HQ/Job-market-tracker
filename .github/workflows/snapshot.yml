@@ -1,0 +1,24 @@
+name: job-snapshot
+on:
+  schedule:
+    - cron: "15 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python tracker.py
+        env:
+          SEARCHAPI_KEY: ${{ secrets.SEARCHAPI_KEY }}
+      - run: |
+          git config user.name "job-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add jobs.db
+          git commit -m "snapshot $(date -u +%F)" || exit 0
+          git push
