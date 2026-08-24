@@ -147,6 +147,14 @@ class ClassifyWorkModeTests(unittest.TestCase):
         )
         self.assertEqual(tracker.classify_work_mode(job), "unknown")
 
+    def test_html_tags_are_stripped_before_window(self):
+        padding = "<p>xxxx</p>" * 180
+        job = sample_job(
+            detected_extensions={"work_from_home": None},
+            description=padding + " you will work onsite with the platform team",
+        )
+        self.assertEqual(tracker.classify_work_mode(job), "onsite")
+
 
 class ParseSalaryTests(unittest.TestCase):
     def test_structured_range(self):
@@ -201,6 +209,13 @@ class ParseSalaryTests(unittest.TestCase):
         job = sample_job(detected_extensions={"salary": "$150K a year"})
         result = tracker.parse_salary(job)
         self.assertEqual(result["salary_min"], 150000)
+
+    def test_unsigned_k_from_structured_field(self):
+        job = sample_job(detected_extensions={"salary": "125K a year"})
+        result = tracker.parse_salary(job)
+        self.assertEqual(result["salary_min"], 125000)
+        self.assertEqual(result["salary_max"], 125000)
+        self.assertEqual(result["salary_source"], "detected_extensions")
 
     def test_swaps_inverted_range(self):
         job = sample_job(detected_extensions={"salary": "$170,000 - $140,000 a year"})
@@ -259,6 +274,24 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(row["posted_date"], "2026-08-18")
         self.assertEqual(row["work_mode"], "remote")
         self.assertEqual(row["salary_min"], 150000)
+        self.assertEqual(row["salary_raw"], "$150K a year")
+
+    def test_migrate_adds_salary_raw(self):
+        self.conn.execute("DROP TABLE snapshots")
+        self.conn.executescript(
+            """
+            CREATE TABLE snapshots (
+                snapshot_date TEXT NOT NULL,
+                job_key TEXT NOT NULL,
+                query TEXT NOT NULL,
+                city TEXT NOT NULL,
+                PRIMARY KEY (snapshot_date, city, query, job_key)
+            );
+            """
+        )
+        tracker.migrate(self.conn)
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(snapshots)")}
+        self.assertIn("salary_raw", cols)
 
 
 class FetchCityTests(unittest.TestCase):

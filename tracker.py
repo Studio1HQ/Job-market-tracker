@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     posted_precision TEXT,
     work_mode       TEXT,
     schedule        TEXT,
+    salary_raw      TEXT,
     salary_min      REAL,
     salary_max      REAL,
     salary_source   TEXT,
@@ -64,6 +65,7 @@ UNIT_DELTA = {
     "month": lambda n: timedelta(days=30 * n),
 }
 
+TAG_RE = re.compile(r"<[^>]+>")
 REMOTE_LOC = re.compile(r"\b(remote|anywhere|work from home|telecommute)\b", re.I)
 HYBRID_HINT = re.compile(
     r"\b(hybrid|"
@@ -73,12 +75,18 @@ HYBRID_HINT = re.compile(
 )
 ONSITE_HINT = re.compile(r"\b(on-?site|in[- ]office|in[- ]person)\b", re.I)
 
-MONEY = r"\$\s?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*([KkMm])?"
+AMOUNT = r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*([KkMm])?"
 SEPARATOR = r"\s*(?:-|to|\u2013|\u2014)\s*"
 PERIOD = r"(?:\s*(?:per|a|an|/)\s*(hour|hr|year|yr|month|mo|week|wk))?"
 
-SALARY_RANGE = re.compile(MONEY + SEPARATOR + MONEY + PERIOD, re.I)
-SALARY_SINGLE = re.compile(MONEY + PERIOD, re.I)
+FIELD_RANGE = re.compile(r"\$?\s?" + AMOUNT + SEPARATOR + r"\$?\s?" + AMOUNT + PERIOD, re.I)
+FIELD_SINGLE = re.compile(r"\$?\s?" + AMOUNT + PERIOD, re.I)
+DESC_RANGE = re.compile(r"\$\s?" + AMOUNT + SEPARATOR + r"\$?\s?" + AMOUNT + PERIOD, re.I)
+DESC_SINGLE = re.compile(r"\$\s?" + AMOUNT + PERIOD, re.I)
+NON_USD = re.compile(
+    r"[\u00a3\u20ac\u00a5\u20b9]|\b(?:EUR|GBP|CAD|AUD|INR)\b|\b(?:C|A|CA|AU|NZ)\$",
+    re.I,
+)
 
 ANNUALIZE = {
     "hour": 2080,
@@ -98,10 +106,7 @@ def api_key() -> str:
     """Read SEARCHAPI_KEY only when a live request is about to go out."""
     key = os.environ.get("SEARCHAPI_KEY")
     if not key:
-        raise SystemExit(
-            "SEARCHAPI_KEY is not set. In PowerShell: "
-            '$env:SEARCHAPI_KEY = "your_key_here"'
-        )
+        raise SystemExit("Set SEARCHAPI_KEY before fetching.")
     return key
 
 
@@ -110,6 +115,7 @@ def fetch_city(
     location: str,
     max_pages: int = 2,
     pause: float = 1.5,
+    max_retries: int = 2,
 ) -> tuple[list[dict], str | None]:
     """Fetch job listings for one query/location pair. Returns (jobs, location_used)."""
     jobs: list[dict] = []
@@ -137,12 +143,12 @@ def fetch_city(
             break
 
         if resp.status_code == 429:
-            if retries >= 2:
-                print(f"  [{location}] rate limited after retries, giving up")
+            if retries >= max_retries:
+                print(f"  [{location}] still limited after {max_retries} retries, stopping")
                 break
-            print(f"  [{location}] rate limited, backing off 60s")
-            time.sleep(60)
             retries += 1
+            print(f"  [{location}] rate limited, retry {retries} in 60s")
+            time.sleep(60)
             continue
         if resp.status_code != 200:
             print(
@@ -199,7 +205,7 @@ def classify_work_mode(job: dict) -> str:
     """Return one of: remote, hybrid, onsite, unknown."""
     flagged = job.get("detected_extensions", {}).get("work_from_home")
     location = job.get("location") or ""
-    head = (job.get("description") or "")[:2000]
+    head = TAG_RE.sub(" ", job.get("description") or "")[:2000]
 
     location_says_remote = bool(REMOTE_LOC.search(location))
     hybrid = bool(HYBRID_HINT.search(head))
@@ -223,25 +229,18 @@ def _to_number(amount: str, suffix: str | None) -> float:
     return value
 
 
-def parse_salary(job: dict) -> dict:
-    """Extract an annualized salary range. Prefers the structured field."""
-    text = job.get("detected_extensions", {}).get("salary")
-    source = "detected_extensions"
-    if not text:
-        text = (job.get("description") or "")[:4000]
-        source = "description"
-    if not text:
-        return {"salary_min": None, "salary_max": None, "salary_source": None}
-
-    match = SALARY_RANGE.search(text)
+def _extract(
+    text: str, rng: re.Pattern, single: re.Pattern
+) -> tuple[float, float] | None:
+    match = rng.search(text)
     if match:
         low = _to_number(match.group(1), match.group(2))
         high = _to_number(match.group(3), match.group(4))
         period = (match.group(5) or "year").lower()
     else:
-        match = SALARY_SINGLE.search(text)
+        match = single.search(text)
         if not match:
-            return {"salary_min": None, "salary_max": None, "salary_source": None}
+            return None
         low = high = _to_number(match.group(1), match.group(2))
         period = (match.group(3) or "year").lower()
 
@@ -250,9 +249,33 @@ def parse_salary(job: dict) -> dict:
     if low > high:
         low, high = high, low
     if not (10_000 <= low <= 2_000_000):
-        return {"salary_min": None, "salary_max": None, "salary_source": None}
+        return None
+    return low, high
 
-    return {"salary_min": low, "salary_max": high, "salary_source": source}
+
+def parse_salary(job: dict) -> dict:
+    """Annualized salary range from the structured field, falling back to the description."""
+    field = job.get("detected_extensions", {}).get("salary")
+    if field and not NON_USD.search(field):
+        found = _extract(field, FIELD_RANGE, FIELD_SINGLE)
+        if found:
+            return {
+                "salary_min": found[0],
+                "salary_max": found[1],
+                "salary_source": "detected_extensions",
+            }
+
+    description = TAG_RE.sub(" ", job.get("description") or "")[:4000]
+    if description:
+        found = _extract(description, DESC_RANGE, DESC_SINGLE)
+        if found:
+            return {
+                "salary_min": found[0],
+                "salary_max": found[1],
+                "salary_source": "description",
+            }
+
+    return {"salary_min": None, "salary_max": None, "salary_source": None}
 
 
 def job_key(job: dict) -> str:
@@ -268,6 +291,15 @@ def job_key(job: dict) -> str:
         ]
     )
     return "h:" + hashlib.sha1(seed.encode()).hexdigest()[:16]
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS skips existing tables, so add columns explicitly."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
+    for column, decl in [("salary_raw", "TEXT")]:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE snapshots ADD COLUMN {column} {decl}")
+    conn.commit()
 
 
 def save_snapshot(conn: sqlite3.Connection, rows: list[dict]) -> int:
@@ -313,6 +345,7 @@ def normalize_jobs(
             "posted_precision": p[1],
             "work_mode": classify_work_mode(j),
             "schedule": j.get("detected_extensions", {}).get("schedule"),
+            "salary_raw": j.get("detected_extensions", {}).get("salary"),
             "position": j.get("position"),
             **parse_salary(j),
         }
@@ -331,6 +364,7 @@ def run_snapshot(
     snapshot = datetime.now(tz=UTC).date()
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    migrate(conn)
     written = 0
 
     for city in cities or CITIES:

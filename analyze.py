@@ -91,22 +91,30 @@ def chart_postings_by_city(
 
 def chart_remote_share(
     df: pd.DataFrame,
+    query: str = QUERY,
     out_path: Path | str | None = None,
 ) -> Path:
     latest = df[df.snapshot_date == df.snapshot_date.max()]
-    share = (
-        latest.assign(is_remote=latest.work_mode.eq("remote"))
-        .groupby("city")["is_remote"]
-        .mean()
-        .mul(100)
-        .sort_values(ascending=True)
+    totals = latest.groupby("city")["job_key"].nunique()
+    remote = (
+        latest[latest.work_mode == "remote"]
+        .groupby("city")["job_key"]
+        .nunique()
+        .reindex(totals.index, fill_value=0)
     )
+    share = (remote / totals * 100).sort_values()
     fig, ax = plt.subplots(figsize=(8, 4.5))
     share.plot.barh(ax=ax, color="#3b6ea5")
-    ax.set_title("Share of postings classified remote")
-    ax.set_xlabel("% of listings")
+    ax.bar_label(
+        ax.containers[0],
+        labels=[f"{share[c]:.0f}%  (n={int(remote[c])}/{int(totals[c])})" for c in share.index],
+        padding=4,
+        fontsize=9,
+    )
+    ax.set_xlim(0, max(share.max() * 1.5, 10))
+    ax.set_title(f'Genuinely remote "{query}" postings, {latest.snapshot_date.max():%d %b %Y}')
+    ax.set_xlabel("% of listings in that city")
     ax.set_ylabel("")
-    ax.bar_label(ax.containers[0], fmt="%.0f%%", padding=3)
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     path = Path(out_path) if out_path else IMAGES / "remote_share.png"
