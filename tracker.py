@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
     salary_max      REAL,
     salary_source   TEXT,
     position        INTEGER,
+    description     TEXT,
+    skills          TEXT,
+    years_experience INTEGER,
     PRIMARY KEY (snapshot_date, city, query, job_key)
 );
 CREATE INDEX IF NOT EXISTS idx_key_date ON snapshots(job_key, snapshot_date);
@@ -100,6 +103,32 @@ ANNUALIZE = {
 }
 
 HTIDOCID_RE = re.compile(r"htidocid=([^&#]+)")
+YEARS_RE = re.compile(
+    r"(\d+)\s*\+?\s*years?(?:\s+of)?(?:\s+experience)?",
+    re.I,
+)
+SKILL_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("postgresql", re.compile(r"\bpostgres(?:ql)?\b", re.I)),
+    ("kubernetes", re.compile(r"\bkubernetes\b|\bk8s\b", re.I)),
+    ("typescript", re.compile(r"\btypescript\b", re.I)),
+    ("javascript", re.compile(r"\bjavascript\b", re.I)),
+    ("terraform", re.compile(r"\bterraform\b", re.I)),
+    ("graphql", re.compile(r"\bgraphql\b", re.I)),
+    ("fastapi", re.compile(r"\bfastapi\b", re.I)),
+    ("django", re.compile(r"\bdjango\b", re.I)),
+    ("spring", re.compile(r"\bspring\s*boot\b|\bspring\b", re.I)),
+    ("python", re.compile(r"\bpython\b", re.I)),
+    ("java", re.compile(r"\bjava\b", re.I)),
+    ("golang", re.compile(r"\bgolang\b", re.I)),
+    ("rust", re.compile(r"\brust\b", re.I)),
+    ("kafka", re.compile(r"\bkafka\b", re.I)),
+    ("redis", re.compile(r"\bredis\b", re.I)),
+    ("docker", re.compile(r"\bdocker\b", re.I)),
+    ("aws", re.compile(r"\baws\b|\bamazon web services\b", re.I)),
+    ("gcp", re.compile(r"\bgcp\b|\bgoogle cloud\b", re.I)),
+    ("azure", re.compile(r"\bazure\b", re.I)),
+    ("grpc", re.compile(r"\bgrpc\b", re.I)),
+]
 
 
 def api_key() -> str:
@@ -278,6 +307,26 @@ def parse_salary(job: dict) -> dict:
     return {"salary_min": None, "salary_max": None, "salary_source": None}
 
 
+def strip_html(text: str | None) -> str:
+    cleaned = TAG_RE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def extract_skills(text: str | None) -> tuple[str | None, int | None]:
+    """Keyword-match frameworks, cloud, and years of experience from a description."""
+    blob = strip_html(text)
+    if not blob:
+        return None, None
+    skills = [name for name, pattern in SKILL_PATTERNS if pattern.search(blob)]
+    years = None
+    match = YEARS_RE.search(blob)
+    if match:
+        years = int(match.group(1))
+        if years > 40:
+            years = None
+    return (",".join(skills) if skills else None), years
+
+
 def job_key(job: dict) -> str:
     """Google's htidocid, or a content hash when the sharing link is missing."""
     match = HTIDOCID_RE.search(job.get("sharing_link") or "")
@@ -296,7 +345,12 @@ def job_key(job: dict) -> str:
 def migrate(conn: sqlite3.Connection) -> None:
     """CREATE TABLE IF NOT EXISTS skips existing tables, so add columns explicitly."""
     existing = {row[1] for row in conn.execute("PRAGMA table_info(snapshots)")}
-    for column, decl in [("salary_raw", "TEXT")]:
+    for column, decl in [
+        ("salary_raw", "TEXT"),
+        ("description", "TEXT"),
+        ("skills", "TEXT"),
+        ("years_experience", "INTEGER"),
+    ]:
         if column not in existing:
             conn.execute(f"ALTER TABLE snapshots ADD COLUMN {column} {decl}")
     conn.commit()
@@ -330,27 +384,35 @@ def normalize_jobs(
         for j in jobs
     ]
     city_label = city.split(",")[0]
-    return [
-        {
-            "snapshot_date": snapshot.isoformat(),
-            "job_key": job_key(j),
-            "query": query,
-            "city": city_label,
-            "title": j.get("title"),
-            "company": j.get("company_name"),
-            "location": j.get("location"),
-            "via": (j.get("via") or "").replace("via ", ""),
-            "posted_at_raw": j.get("detected_extensions", {}).get("posted_at"),
-            "posted_date": p[0],
-            "posted_precision": p[1],
-            "work_mode": classify_work_mode(j),
-            "schedule": j.get("detected_extensions", {}).get("schedule"),
-            "salary_raw": j.get("detected_extensions", {}).get("salary"),
-            "position": j.get("position"),
-            **parse_salary(j),
-        }
-        for j, p in zip(jobs, posted)
-    ]
+    rows = []
+    for j, p in zip(jobs, posted):
+        skills, years = extract_skills(
+            " ".join(filter(None, [j.get("title"), j.get("description")]))
+        )
+        rows.append(
+            {
+                "snapshot_date": snapshot.isoformat(),
+                "job_key": job_key(j),
+                "query": query,
+                "city": city_label,
+                "title": j.get("title"),
+                "company": j.get("company_name"),
+                "location": j.get("location"),
+                "via": (j.get("via") or "").replace("via ", ""),
+                "posted_at_raw": j.get("detected_extensions", {}).get("posted_at"),
+                "posted_date": p[0],
+                "posted_precision": p[1],
+                "work_mode": classify_work_mode(j),
+                "schedule": j.get("detected_extensions", {}).get("schedule"),
+                "salary_raw": j.get("detected_extensions", {}).get("salary"),
+                "position": j.get("position"),
+                "description": strip_html(j.get("description"))[:12_000] or None,
+                "skills": skills,
+                "years_experience": years,
+                **parse_salary(j),
+            }
+        )
+    return rows
 
 
 def run_snapshot(
@@ -381,8 +443,117 @@ def run_snapshot(
             print(f"{city.split(',')[0]}: no rows")
         time.sleep(pause_between_cities)
 
+    send_slack_alerts(conn, snapshot.isoformat(), query)
     conn.close()
     return written
+
+
+def previous_snapshot_date(
+    conn: sqlite3.Connection, snapshot_date: str, query: str
+) -> str | None:
+    row = conn.execute(
+        "SELECT MAX(snapshot_date) FROM snapshots "
+        "WHERE snapshot_date < ? AND query = ?",
+        (snapshot_date, query),
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def new_posting_rows(
+    conn: sqlite3.Connection, snapshot_date: str, query: str
+) -> list[sqlite3.Row]:
+    """Rows present today and absent from the previous snapshot for this query."""
+    conn.row_factory = sqlite3.Row
+    prev = previous_snapshot_date(conn, snapshot_date, query)
+    if not prev:
+        return []
+    return list(
+        conn.execute(
+            """
+            SELECT * FROM snapshots
+            WHERE snapshot_date = ? AND query = ?
+              AND job_key NOT IN (
+                  SELECT job_key FROM snapshots
+                  WHERE snapshot_date = ? AND query = ?
+              )
+            ORDER BY city, company, title
+            """,
+            (snapshot_date, query, prev, query),
+        )
+    )
+
+
+def alert_criteria() -> dict:
+    floor_raw = os.environ.get("ALERT_SALARY_FLOOR", "").strip()
+    companies = [
+        part.strip()
+        for part in os.environ.get("ALERT_COMPANIES", "").split(",")
+        if part.strip()
+    ]
+    return {
+        "salary_floor": float(floor_raw) if floor_raw else None,
+        "remote_only": os.environ.get("ALERT_REMOTE_ONLY", "").lower()
+        in {"1", "true", "yes"},
+        "companies": companies,
+    }
+
+
+def matches_alert(row: sqlite3.Row | dict, criteria: dict) -> bool:
+    work_mode = row["work_mode"]
+    salary_min = row["salary_min"]
+    company = row["company"] or ""
+    if criteria["remote_only"] and work_mode != "remote":
+        return False
+    if criteria["salary_floor"] is not None:
+        if salary_min is None or salary_min < criteria["salary_floor"]:
+            return False
+    if criteria["companies"]:
+        lowered = company.lower()
+        if not any(name.lower() in lowered for name in criteria["companies"]):
+            return False
+    return True
+
+
+def format_alert_text(rows: list[sqlite3.Row], query: str) -> str:
+    lines = [f"*{len(rows)} new {query} posting(s)*"]
+    for row in rows[:20]:
+        salary = (
+            f"${int(row['salary_min'] / 1000)}k+"
+            if row["salary_min"]
+            else "salary n/a"
+        )
+        skills = row["skills"] or "skills n/a"
+        lines.append(
+            f"• *{row['title']}* at {row['company']} ({row['city']}) — "
+            f"{row['work_mode']} — {salary} — {skills}"
+        )
+    if len(rows) > 20:
+        lines.append(f"…and {len(rows) - 20} more")
+    return "\n".join(lines)
+
+
+def send_slack_alerts(
+    conn: sqlite3.Connection, snapshot_date: str, query: str
+) -> int:
+    """Push filtered new postings to Slack. No-op without SLACK_WEBHOOK_URL."""
+    webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return 0
+    matches = [
+        row
+        for row in new_posting_rows(conn, snapshot_date, query)
+        if matches_alert(row, alert_criteria())
+    ]
+    if not matches:
+        print("alerts: no new postings matched filters")
+        return 0
+    text = format_alert_text(matches, query)
+    resp = requests.post(webhook, json={"text": text}, timeout=15)
+    if resp.status_code >= 300:
+        print(f"alerts: Slack HTTP {resp.status_code}: {resp.text[:200]}")
+        return 0
+    print(f"alerts: posted {len(matches)} new listing(s) to Slack")
+    return len(matches)
 
 
 def main() -> None:
