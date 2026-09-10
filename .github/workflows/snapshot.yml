@@ -16,6 +16,10 @@ jobs:
       - run: python tracker.py
         env:
           SEARCHAPI_KEY: ${{ secrets.SEARCHAPI_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ALERT_SALARY_FLOOR: ${{ vars.ALERT_SALARY_FLOOR }}
+          ALERT_REMOTE_ONLY: ${{ vars.ALERT_REMOTE_ONLY }}
+          ALERT_COMPANIES: ${{ vars.ALERT_COMPANIES }}
       - run: |
           git config user.name "job-bot"
           git config user.email "bot@users.noreply.github.com"

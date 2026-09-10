@@ -275,6 +275,8 @@ class SnapshotStoreTests(unittest.TestCase):
         self.assertEqual(row["work_mode"], "remote")
         self.assertEqual(row["salary_min"], 150000)
         self.assertEqual(row["salary_raw"], "$150K a year")
+        self.assertIn("python", (row["skills"] or "").split(","))
+        self.assertTrue(row["description"])
 
     def test_migrate_adds_salary_raw(self):
         self.conn.execute("DROP TABLE snapshots")
@@ -292,6 +294,127 @@ class SnapshotStoreTests(unittest.TestCase):
         tracker.migrate(self.conn)
         cols = {row[1] for row in self.conn.execute("PRAGMA table_info(snapshots)")}
         self.assertIn("salary_raw", cols)
+        self.assertIn("description", cols)
+        self.assertIn("skills", cols)
+
+
+class SkillAndAlertTests(unittest.TestCase):
+    def test_extracts_skills_and_years(self):
+        text = (
+            "We use Python, FastAPI, and AWS. Kubernetes and Docker required. "
+            "5 years of experience preferred."
+        )
+        skills, years = tracker.extract_skills(text)
+        self.assertEqual(years, 5)
+        self.assertIn("python", skills.split(","))
+        self.assertIn("fastapi", skills.split(","))
+        self.assertIn("aws", skills.split(","))
+        self.assertIn("kubernetes", skills.split(","))
+        self.assertIn("docker", skills.split(","))
+
+    def test_strips_html_before_skill_match(self):
+        skills, _ = tracker.extract_skills("<p>Experience with <b>Python</b> and AWS.</p>")
+        self.assertEqual(set(skills.split(",")), {"python", "aws"})
+
+    def test_new_postings_are_today_minus_yesterday(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "jobs.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(tracker.SCHEMA)
+        tracker.migrate(conn)
+        yesterday = [
+            {
+                "snapshot_date": "2026-08-21",
+                "job_key": "keep",
+                "query": tracker.QUERY,
+                "city": "Austin",
+                "title": "Old",
+                "company": "Acme",
+                "work_mode": "remote",
+                "salary_min": 150000,
+                "skills": "python",
+            },
+            {
+                "snapshot_date": "2026-08-21",
+                "job_key": "gone",
+                "query": tracker.QUERY,
+                "city": "Austin",
+                "title": "Gone",
+                "company": "Acme",
+                "work_mode": "onsite",
+                "salary_min": None,
+                "skills": None,
+            },
+        ]
+        today = [
+            {
+                "snapshot_date": "2026-08-22",
+                "job_key": "keep",
+                "query": tracker.QUERY,
+                "city": "Austin",
+                "title": "Old",
+                "company": "Acme",
+                "work_mode": "remote",
+                "salary_min": 150000,
+                "skills": "python",
+            },
+            {
+                "snapshot_date": "2026-08-22",
+                "job_key": "fresh",
+                "query": tracker.QUERY,
+                "city": "Denver",
+                "title": "New Backend",
+                "company": "Stripe",
+                "work_mode": "remote",
+                "salary_min": 180000,
+                "skills": "python,aws",
+            },
+        ]
+        tracker.save_snapshot(conn, yesterday)
+        tracker.save_snapshot(conn, today)
+        rows = tracker.new_posting_rows(conn, "2026-08-22", tracker.QUERY)
+        keys = {row["job_key"] for row in rows}
+        self.assertEqual(keys, {"fresh"})
+        conn.close()
+
+    def test_alert_filters_salary_remote_and_company(self):
+        row = {
+            "work_mode": "remote",
+            "salary_min": 180000,
+            "company": "Stripe",
+        }
+        criteria = {
+            "salary_floor": 140000,
+            "remote_only": True,
+            "companies": ["Stripe"],
+        }
+        self.assertTrue(tracker.matches_alert(row, criteria))
+        self.assertFalse(
+            tracker.matches_alert(
+                {**row, "work_mode": "onsite"}, criteria
+            )
+        )
+        self.assertFalse(
+            tracker.matches_alert({**row, "salary_min": 90000}, criteria)
+        )
+        self.assertFalse(
+            tracker.matches_alert({**row, "company": "Other Co"}, criteria)
+        )
+
+    @patch("tracker.requests.post")
+    def test_slack_skipped_without_webhook(self, mock_post):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        db = Path(tmp.name) / "jobs.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(tracker.SCHEMA)
+        tracker.migrate(conn)
+        with patch.dict("os.environ", {}, clear=True):
+            sent = tracker.send_slack_alerts(conn, "2026-08-22", tracker.QUERY)
+        self.assertEqual(sent, 0)
+        mock_post.assert_not_called()
+        conn.close()
 
 
 class FetchCityTests(unittest.TestCase):
